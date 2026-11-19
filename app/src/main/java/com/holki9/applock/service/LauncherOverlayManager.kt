@@ -3,8 +3,8 @@ package com.holki9.applock.service
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.content.Context
-import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -14,7 +14,6 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.view.Gravity
-import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -35,7 +34,10 @@ class LauncherOverlayManager(private val context: Context) {
         hideOverlay()
     }
 
-    fun showQuickLockButton(packageName: String, appName: String) {
+    /**
+     * Shows an action button attached directly underneath the launcher's popup menu.
+     */
+    fun showAttachedButton(packageName: String, appName: String, anchorRect: Rect) {
         val prefs = PreferencesManager.getInstance(context)
         if (!prefs.isLauncherQuickLockEnabled()) return
         if (!android.provider.Settings.canDrawOverlays(context)) return
@@ -44,117 +46,134 @@ class LauncherOverlayManager(private val context: Context) {
             currentPackage = packageName
             val isLocked = prefs.isAppLocked(packageName)
 
-            // If already showing, simply update text & state instead of re-creating window!
+            val metrics = context.resources.displayMetrics
+            val screenHeight = metrics.heightPixels
+            val popupWidth = anchorRect.width()
+            val popupHeight = dpToPx(50)
+
+            val targetX = anchorRect.left
+            // Position directly underneath the popup, or above if near screen bottom
+            val targetY = if (anchorRect.bottom + popupHeight + dpToPx(24) < screenHeight) {
+                anchorRect.bottom + dpToPx(8)
+            } else {
+                maxOf(dpToPx(40), anchorRect.top - popupHeight - dpToPx(8))
+            }
+
+            // If already showing and attached, update position and content smoothly
             if (currentOverlayView != null && currentOverlayView?.isAttachedToWindow == true) {
                 updateViewContent(isLocked, appName)
+                val lp = currentOverlayView?.layoutParams as? WindowManager.LayoutParams
+                if (lp != null) {
+                    lp.x = targetX
+                    lp.y = targetY
+                    lp.width = popupWidth
+                    windowManager.updateViewLayout(currentOverlayView, lp)
+                }
                 handler.removeCallbacks(autoDismissRunnable)
-                handler.postDelayed(autoDismissRunnable, 5000)
+                handler.postDelayed(autoDismissRunnable, 6000)
                 return@post
             }
 
             hideOverlayImmediate()
 
-            val pillLayout = LinearLayout(context).apply {
+            val cardLayout = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+                gravity = Gravity.CENTER
 
                 val bg = GradientDrawable().apply {
                     shape = GradientDrawable.RECTANGLE
-                    cornerRadius = dpToPx(28).toFloat()
+                    cornerRadius = dpToPx(24).toFloat()
                     if (isLocked) {
-                        setColor(0xFF1E293B.toInt()) // Slate dark
-                        setStroke(dpToPx(2), 0xFFF59E0B.toInt()) // Amber outline for locked
+                        setColor(0xFFF8FAFC.toInt())
+                        setStroke(dpToPx(1.5f), 0xFFF59E0B.toInt()) // Amber stroke
                     } else {
-                        setColor(0xFF4F46E5.toInt()) // Primary Indigo
-                        setStroke(dpToPx(1), 0xFF818CF8.toInt())
+                        setColor(0xFFFFFFFF.toInt()) // Pure white matching One UI card
+                        setStroke(dpToPx(1.5f), 0xFFE2E8F0.toInt()) // Subtle clean border
                     }
                 }
                 background = bg
-                setPadding(dpToPx(18), dpToPx(12), dpToPx(20), dpToPx(12))
-                elevation = dpToPx(12).toFloat()
+                setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
+                elevation = dpToPx(10).toFloat()
             }
 
             val iconText = TextView(context).apply {
                 text = if (isLocked) "🔓" else "🔒"
                 textSize = 18f
-                setTextColor(Color.WHITE)
                 setPadding(0, 0, dpToPx(8), 0)
             }
 
             val labelText = TextView(context).apply {
                 val action = if (isLocked) "Снять защиту" else "Заблокировать"
-                val truncatedName = if (appName.length > 15) appName.take(13) + "…" else appName
+                val truncatedName = if (appName.length > 16) appName.take(14) + "…" else appName
                 text = "$action «$truncatedName»"
                 textSize = 15f
                 setTypeface(null, Typeface.BOLD)
-                setTextColor(Color.WHITE)
+                setTextColor(if (isLocked) 0xFFD97706.toInt() else 0xFF0F172A.toInt())
             }
 
-            pillLayout.addView(iconText)
-            pillLayout.addView(labelText)
+            cardLayout.addView(iconText)
+            cardLayout.addView(labelText)
 
             currentIconText = iconText
             currentLabelText = labelText
 
             // Click listener
-            pillLayout.setOnClickListener {
+            cardLayout.setOnClickListener {
                 vibrateClick()
                 val pkg = currentPackage ?: return@setOnClickListener
                 val newState = prefs.toggleLock(pkg)
                 if (newState) {
                     iconText.text = "✓"
                     labelText.text = "«$appName» защищен!"
-                    (pillLayout.background as? GradientDrawable)?.apply {
-                        setColor(0xFF10B981.toInt()) // Emerald Green
-                        setStroke(dpToPx(1), 0xFF34D399.toInt())
+                    labelText.setTextColor(0xFF047857.toInt())
+                    (cardLayout.background as? GradientDrawable)?.apply {
+                        setColor(0xFFD1FAE5.toInt()) // Emerald light
+                        setStroke(dpToPx(1.5f), 0xFF10B981.toInt())
                     }
                 } else {
                     iconText.text = "✓"
                     labelText.text = "«$appName» разблокирован"
-                    (pillLayout.background as? GradientDrawable)?.apply {
-                        setColor(0xFF64748B.toInt()) // Slate
-                        setStroke(dpToPx(1), 0xFF94A3B8.toInt())
+                    labelText.setTextColor(0xFF475569.toInt())
+                    (cardLayout.background as? GradientDrawable)?.apply {
+                        setColor(0xFFF1F5F9.toInt())
+                        setStroke(dpToPx(1.5f), 0xFF94A3B8.toInt())
                     }
                 }
 
                 handler.postDelayed({
                     hideOverlay()
-                }, 900)
+                }, 700)
             }
 
-            // Window Layout Params - Positioned near TOP center
             val layoutParams = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
+                popupWidth,
+                popupHeight,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
             ).apply {
-                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                y = dpToPx(85) // Gracefully below status bar
+                gravity = Gravity.TOP or Gravity.START
+                x = targetX
+                y = targetY
             }
 
-            // Entry animation
-            pillLayout.alpha = 0f
-            pillLayout.translationY = -dpToPx(30).toFloat()
-            pillLayout.scaleX = 0.9f
-            pillLayout.scaleY = 0.9f
+            // Smooth appearance
+            cardLayout.alpha = 0f
+            cardLayout.scaleY = 0.85f
 
             try {
-                windowManager.addView(pillLayout, layoutParams)
-                currentOverlayView = pillLayout
+                windowManager.addView(cardLayout, layoutParams)
+                currentOverlayView = cardLayout
 
-                pillLayout.animate()
+                cardLayout.animate()
                     .alpha(1f)
-                    .translationY(0f)
-                    .scaleX(1f)
                     .scaleY(1f)
-                    .setDuration(220)
+                    .setDuration(180)
                     .start()
 
                 handler.removeCallbacks(autoDismissRunnable)
-                handler.postDelayed(autoDismissRunnable, 5000)
+                handler.postDelayed(autoDismissRunnable, 6000)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -163,16 +182,17 @@ class LauncherOverlayManager(private val context: Context) {
 
     private fun updateViewContent(isLocked: Boolean, appName: String) {
         val action = if (isLocked) "Снять защиту" else "Заблокировать"
-        val truncatedName = if (appName.length > 15) appName.take(13) + "…" else appName
+        val truncatedName = if (appName.length > 16) appName.take(14) + "…" else appName
         currentIconText?.text = if (isLocked) "🔓" else "🔒"
         currentLabelText?.text = "$action «$truncatedName»"
+        currentLabelText?.setTextColor(if (isLocked) 0xFFD97706.toInt() else 0xFF0F172A.toInt())
         (currentOverlayView?.background as? GradientDrawable)?.apply {
             if (isLocked) {
-                setColor(0xFF1E293B.toInt())
-                setStroke(dpToPx(2), 0xFFF59E0B.toInt())
+                setColor(0xFFF8FAFC.toInt())
+                setStroke(dpToPx(1.5f), 0xFFF59E0B.toInt())
             } else {
-                setColor(0xFF4F46E5.toInt())
-                setStroke(dpToPx(1), 0xFF818CF8.toInt())
+                setColor(0xFFFFFFFF.toInt())
+                setStroke(dpToPx(1.5f), 0xFFE2E8F0.toInt())
             }
         }
     }
@@ -184,10 +204,8 @@ class LauncherOverlayManager(private val context: Context) {
                 try {
                     view.animate()
                         .alpha(0f)
-                        .translationY(-dpToPx(25).toFloat())
-                        .scaleX(0.9f)
-                        .scaleY(0.9f)
-                        .setDuration(160)
+                        .scaleY(0.85f)
+                        .setDuration(140)
                         .setListener(object : AnimatorListenerAdapter() {
                             override fun onAnimationEnd(animation: Animator) {
                                 hideOverlayImmediate()
@@ -233,6 +251,11 @@ class LauncherOverlayManager(private val context: Context) {
                 v?.vibrate(35)
             }
         } catch (_: Exception) {}
+    }
+
+    private fun dpToPx(dp: Float): Int {
+        val density = context.resources.displayMetrics.density
+        return (dp * density).toInt()
     }
 
     private fun dpToPx(dp: Int): Int {

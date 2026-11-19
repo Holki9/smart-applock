@@ -2,6 +2,9 @@ package com.holki9.applock.service
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Intent
+import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.holki9.applock.data.AppLockState
@@ -13,6 +16,7 @@ class AppLockAccessibilityService : AccessibilityService() {
 
     private lateinit var prefs: PreferencesManager
     private lateinit var overlayManager: LauncherOverlayManager
+    private val handler = Handler(Looper.getMainLooper())
 
     private val launcherPackages = setOf(
         "com.sec.android.app.launcher",          // Samsung One UI Home
@@ -25,19 +29,11 @@ class AppLockAccessibilityService : AccessibilityService() {
         "com.android.launcher3"                 // Launcher3
     )
 
-    @Volatile
-    private var lastLongClickedPackage: String? = null
-    @Volatile
-    private var lastLongClickedAppName: String? = null
-    @Volatile
-    private var lastLongClickedTime: Long = 0L
-
     override fun onCreate() {
         super.onCreate()
         prefs = PreferencesManager.getInstance(this)
         overlayManager = LauncherOverlayManager(this)
 
-        // Super-fast background cache init (~15ms, 0 RAM overhead)
         Thread {
             AppHelper.initPackageCache(this)
         }.start()
@@ -48,57 +44,29 @@ class AppLockAccessibilityService : AccessibilityService() {
         val packageName = event.packageName?.toString() ?: return
 
         when (event.eventType) {
-            AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> {
-                handleViewLongClicked(packageName, event)
-            }
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                 handleWindowStateChanged(packageName, event)
             }
         }
     }
 
-    private fun handleViewLongClicked(packageName: String, event: AccessibilityEvent) {
-        if (!prefs.isLauncherQuickLockEnabled()) return
-        if (!launcherPackages.contains(packageName)) return
-
-        val source = event.source ?: return
-        try {
-            var rawText = source.text?.toString() ?: source.contentDescription?.toString()
-
-            // If root source has no text, inspect immediate children (depth 1 only)
-            if (rawText.isNullOrBlank()) {
-                val count = minOf(source.childCount, 6)
-                for (i in 0 until count) {
-                    val child = source.getChild(i) ?: continue
-                    val text = child.text?.toString() ?: child.contentDescription?.toString()
-                    if (!text.isNullOrBlank()) {
-                        rawText = text
-                        break
-                    }
-                }
-            }
-
-            if (!rawText.isNullOrBlank()) {
-                val matched = AppHelper.findPackageByLabel(rawText)
-                if (matched != null && matched != this.packageName) {
-                    val appName = AppHelper.findLabelByPackage(this, matched)
-                    lastLongClickedPackage = matched
-                    lastLongClickedAppName = appName
-                    lastLongClickedTime = System.currentTimeMillis()
-                    overlayManager.showQuickLockButton(matched, appName)
-                }
-            }
-        } catch (_: Exception) {}
-    }
-
     private fun handleWindowStateChanged(packageName: String, event: AccessibilityEvent) {
         val now = System.currentTimeMillis()
 
-        // 1. If on Launcher
+        // 1. If inside Launcher (Home / App Drawer)
         if (launcherPackages.contains(packageName)) {
+            // Ignore RecentsActivity (task switcher screen)
+            val className = event.className?.toString() ?: ""
+            if (className.contains("RecentsActivity") || className.contains("Quickstep")) {
+                overlayManager.hideOverlay()
+                return
+            }
+
             if (prefs.isLauncherQuickLockEnabled()) {
-                // Check if a popup window just showed up
-                checkLauncherPopupOnStateChange(event, now)
+                // Check immediately and also 120ms later to account for One UI popup opening animation
+                checkForLauncherPopup()
+                handler.removeCallbacksAndMessages(null)
+                handler.postDelayed({ checkForLauncherPopup() }, 120)
             }
             return
         }
@@ -119,7 +87,7 @@ class AppLockAccessibilityService : AccessibilityService() {
         val policy = prefs.getRelockPolicy()
         AppLockState.onPackageChanged(packageName, policy)
 
-        // Instant O(1) hash set check
+        // Instant hash set check
         if (!prefs.isAppLocked(packageName)) return
 
         // Check if temporarily unlocked
@@ -142,60 +110,95 @@ class AppLockAccessibilityService : AccessibilityService() {
         startActivity(lockIntent)
     }
 
-    private fun checkLauncherPopupOnStateChange(event: AccessibilityEvent, now: Long) {
-        // If an icon was long-clicked in the last 4 seconds, keep or show the button
-        val lastPkg = lastLongClickedPackage
-        val lastName = lastLongClickedAppName
-        if (lastPkg != null && lastName != null && (now - lastLongClickedTime < 4000)) {
-            overlayManager.showQuickLockButton(lastPkg, lastName)
-            return
-        }
-
-        // Also inspect event.text (many launcher popups emit their title in event.text)
+    /**
+     * Finds Samsung One UI popup menu by searching for its distinctive buttons ("Выбрать" / "Select").
+     * Attaches our lock button directly underneath the popup card.
+     */
+    private fun checkForLauncherPopup() {
+        val root = rootInActiveWindow ?: return
         try {
-            val eventTexts = event.text
-            if (!eventTexts.isNullOrEmpty()) {
-                for (item in eventTexts) {
-                    val str = item?.toString() ?: continue
-                    val matched = AppHelper.findPackageByLabel(str)
-                    if (matched != null && matched != this.packageName) {
-                        val appName = AppHelper.findLabelByPackage(this, matched)
-                        lastLongClickedPackage = matched
-                        lastLongClickedAppName = appName
-                        lastLongClickedTime = now
-                        overlayManager.showQuickLockButton(matched, appName)
+            // Find popup by its unique buttons
+            var selectNodes = root.findAccessibilityNodeInfosByText("Выбрать")
+            if (selectNodes.isNullOrEmpty()) {
+                selectNodes = root.findAccessibilityNodeInfosByText("Select")
+            }
+            if (selectNodes.isNullOrEmpty()) {
+                selectNodes = root.findAccessibilityNodeInfosByText("Добавить на главный экран")
+            }
+
+            if (selectNodes.isNullOrEmpty()) {
+                overlayManager.hideOverlay()
+                return
+            }
+
+            val selectNode = selectNodes.firstOrNull() ?: return
+
+            // Traverse up to find the popup container card
+            var popupCard: AccessibilityNodeInfo? = selectNode.parent
+            while (popupCard != null && popupCard.parent != null) {
+                val p = popupCard.parent
+                val pClass = p.className?.toString() ?: ""
+                if (pClass.contains("DragLayer") || pClass.contains("Applist") ||
+                    pClass.contains("Workspace") || pClass.contains("DecorView") ||
+                    pClass.contains("Appscreen") || pClass.contains("ConstraintLayout")
+                ) {
+                    break
+                }
+                popupCard = p
+            }
+
+            if (popupCard == null) return
+
+            val popupRect = Rect()
+            popupCard.getBoundsInScreen(popupRect)
+
+            // Extract the app title
+            var detectedTitle: String? = null
+            val ignoreWords = setOf(
+                "выбрать", "добавить на г...", "добавить на главный экран", "удалить",
+                "отключить", "виджеты", "select", "remove", "uninstall", "widgets",
+                "информация о приложении", "app info"
+            )
+
+            fun findTitle(node: AccessibilityNodeInfo, depth: Int) {
+                if (depth > 3 || detectedTitle != null) return
+                val text = node.text?.toString() ?: node.contentDescription?.toString()
+                if (!text.isNullOrBlank()) {
+                    val lower = text.trim().lowercase()
+                    if (!ignoreWords.contains(lower) && !lower.startsWith("добавить")) {
+                        detectedTitle = text.trim()
+                        return
+                    }
+                }
+                for (i in 0 until minOf(node.childCount, 6)) {
+                    val child = node.getChild(i) ?: continue
+                    findTitle(child, depth + 1)
+                }
+            }
+
+            findTitle(popupCard, 0)
+
+            if (!detectedTitle.isNullOrBlank()) {
+                val matchedPackage = AppHelper.findPackageByLabel(detectedTitle)
+                if (matchedPackage != null && matchedPackage != this.packageName) {
+                    overlayManager.showAttachedButton(matchedPackage, detectedTitle!!, popupRect)
+                    return
+                }
+            }
+
+            // Fallback: if title not found inside card, check direct children
+            for (i in 0 until minOf(popupCard.childCount, 4)) {
+                val child = popupCard.getChild(i) ?: continue
+                val text = child.text?.toString()
+                if (!text.isNullOrBlank() && !ignoreWords.contains(text.lowercase().trim())) {
+                    val matchedPackage = AppHelper.findPackageByLabel(text)
+                    if (matchedPackage != null && matchedPackage != this.packageName) {
+                        overlayManager.showAttachedButton(matchedPackage, text, popupRect)
                         return
                     }
                 }
             }
-
-            // Shallow check of source node (depth at most 2, max 10 nodes)
-            val source = event.source ?: return
-            inspectShallowForApp(source, depth = 0)
         } catch (_: Exception) {}
-    }
-
-    private fun inspectShallowForApp(node: AccessibilityNodeInfo, depth: Int) {
-        if (depth > 2) return
-
-        val text = node.text?.toString() ?: node.contentDescription?.toString()
-        if (!text.isNullOrBlank() && text.length > 2) {
-            val matched = AppHelper.findPackageByLabel(text)
-            if (matched != null && matched != this.packageName) {
-                val appName = AppHelper.findLabelByPackage(this, matched)
-                lastLongClickedPackage = matched
-                lastLongClickedAppName = appName
-                lastLongClickedTime = System.currentTimeMillis()
-                overlayManager.showQuickLockButton(matched, appName)
-                return
-            }
-        }
-
-        val childCount = minOf(node.childCount, 6)
-        for (i in 0 until childCount) {
-            val child = node.getChild(i) ?: continue
-            inspectShallowForApp(child, depth + 1)
-        }
     }
 
     override fun onInterrupt() {
