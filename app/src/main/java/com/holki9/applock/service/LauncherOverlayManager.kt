@@ -47,11 +47,18 @@ class LauncherOverlayManager(private val context: Context) {
             val isLocked = prefs.isAppLocked(packageName)
 
             val metrics = context.resources.displayMetrics
+            val screenWidth = metrics.widthPixels
             val screenHeight = metrics.heightPixels
-            val popupWidth = anchorRect.width()
             val popupHeight = dpToPx(50)
 
-            val targetX = anchorRect.left
+            val safeX = maxOf(dpToPx(12), anchorRect.left)
+            val popupWidth = if (anchorRect.width() > 100) {
+                minOf(anchorRect.width(), screenWidth - safeX - dpToPx(12))
+            } else {
+                screenWidth - dpToPx(32)
+            }
+
+            val targetX = safeX
             // Position directly underneath the popup, or above if near screen bottom
             val targetY = if (anchorRect.bottom + popupHeight + dpToPx(24) < screenHeight) {
                 anchorRect.bottom + dpToPx(8)

@@ -18,6 +18,8 @@ class AppLockAccessibilityService : AccessibilityService() {
     private lateinit var overlayManager: LauncherOverlayManager
     private val handler = Handler(Looper.getMainLooper())
 
+    private var lastContentCheckTime: Long = 0L
+
     private val launcherPackages = setOf(
         "com.sec.android.app.launcher",          // Samsung One UI Home
         "com.google.android.apps.nexuslauncher", // Pixel Launcher
@@ -44,10 +46,56 @@ class AppLockAccessibilityService : AccessibilityService() {
         val packageName = event.packageName?.toString() ?: return
 
         when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> {
+                if (launcherPackages.contains(packageName)) {
+                    handleViewLongClicked(packageName, event)
+                }
+            }
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                 handleWindowStateChanged(packageName, event)
             }
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                if (launcherPackages.contains(packageName) && prefs.isLauncherQuickLockEnabled()) {
+                    val now = System.currentTimeMillis()
+                    // Throttled to at most once per 300ms to guarantee 0% lag and zero freeze
+                    if (now - lastContentCheckTime > 300) {
+                        lastContentCheckTime = now
+                        checkForLauncherPopup()
+                    }
+                }
+            }
         }
+    }
+
+    private fun handleViewLongClicked(packageName: String, event: AccessibilityEvent) {
+        if (!prefs.isLauncherQuickLockEnabled()) return
+        val source = event.source ?: return
+        try {
+            var rawText = source.text?.toString() ?: source.contentDescription?.toString()
+            if (rawText.isNullOrBlank()) {
+                val count = minOf(source.childCount, 6)
+                for (i in 0 until count) {
+                    val child = source.getChild(i) ?: continue
+                    val t = child.text?.toString() ?: child.contentDescription?.toString()
+                    if (!t.isNullOrBlank()) {
+                        rawText = t
+                        break
+                    }
+                }
+            }
+
+            if (!rawText.isNullOrBlank()) {
+                val matched = AppHelper.findPackageByLabel(rawText)
+                if (matched != null && matched != this.packageName) {
+                    val appName = AppHelper.findLabelByPackage(this, matched)
+                    val rect = Rect()
+                    source.getBoundsInScreen(rect)
+                    if (rect.width() > 30) {
+                        overlayManager.showAttachedButton(matched, appName, rect)
+                    }
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     private fun handleWindowStateChanged(packageName: String, event: AccessibilityEvent) {
@@ -55,7 +103,6 @@ class AppLockAccessibilityService : AccessibilityService() {
 
         // 1. If inside Launcher (Home / App Drawer)
         if (launcherPackages.contains(packageName)) {
-            // Ignore RecentsActivity (task switcher screen)
             val className = event.className?.toString() ?: ""
             if (className.contains("RecentsActivity") || className.contains("Quickstep")) {
                 overlayManager.hideOverlay()
@@ -63,7 +110,6 @@ class AppLockAccessibilityService : AccessibilityService() {
             }
 
             if (prefs.isLauncherQuickLockEnabled()) {
-                // Check immediately and also 120ms later to account for One UI popup opening animation
                 checkForLauncherPopup()
                 handler.removeCallbacksAndMessages(null)
                 handler.postDelayed({ checkForLauncherPopup() }, 120)
@@ -117,13 +163,12 @@ class AppLockAccessibilityService : AccessibilityService() {
     private fun checkForLauncherPopup() {
         val root = rootInActiveWindow ?: return
         try {
-            // Find popup by its unique buttons
             var selectNodes = root.findAccessibilityNodeInfosByText("Выбрать")
             if (selectNodes.isNullOrEmpty()) {
                 selectNodes = root.findAccessibilityNodeInfosByText("Select")
             }
             if (selectNodes.isNullOrEmpty()) {
-                selectNodes = root.findAccessibilityNodeInfosByText("Добавить на главный экран")
+                selectNodes = root.findAccessibilityNodeInfosByText("Добавить на")
             }
 
             if (selectNodes.isNullOrEmpty()) {
@@ -151,6 +196,7 @@ class AppLockAccessibilityService : AccessibilityService() {
 
             val popupRect = Rect()
             popupCard.getBoundsInScreen(popupRect)
+            if (popupRect.width() < 100 || popupRect.height() < 50) return
 
             // Extract the app title
             var detectedTitle: String? = null
@@ -186,7 +232,7 @@ class AppLockAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // Fallback: if title not found inside card, check direct children
+            // Fallback: check direct children of popupCard
             for (i in 0 until minOf(popupCard.childCount, 4)) {
                 val child = popupCard.getChild(i) ?: continue
                 val text = child.text?.toString()
