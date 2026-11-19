@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">Smart AppLock</string>
+    <string name="app_name_ru">Замок Приложений</string>
+    <string name="accessibility_service_desc">Сервис необходим для мгновенного обнаружения запуска защищённых приложений и отображения контекстной кнопки быстрой блокировки при удержании иконки на главном экране.</string>
+    <string name="tile_label">Блокировка</string>
+    <string name="tile_app_locked">Приложение защищено</string>
+    <string name="tile_app_unlocked">Приложение разблокировано</string>
+
+    <!-- Recovery questions -->
+    <string name="q_city">Ваш любимый город?</string>
+    <string name="q_pet">Кличка вашего первого питомца?</string>
+    <string name="q_school">Номер или название вашей школы?</string>
+    <string name="q_book">Ваша любимая книга или фильм?</string>
+    <string name="q_car">Марка вашего первого автомобиля?</string>
+</resources>
